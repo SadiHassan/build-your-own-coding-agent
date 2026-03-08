@@ -1,9 +1,14 @@
+import json
 import os
 import sys
 import subprocess
 import time
 import requests
 from dotenv import load_dotenv
+try:
+    from ddgs import DDGS
+except ImportError:
+    DDGS = None
 
 load_dotenv()
 
@@ -119,6 +124,76 @@ class Brain:
         raise NotImplementedError
 
 
+# --- Streaming Helpers ---
+
+def parse_sse_events(raw_lines):
+    """Parse raw SSE lines into a list of event dicts."""
+    events = []
+    for line in raw_lines:
+        if isinstance(line, bytes):
+            line = line.decode("utf-8")
+        if not line.startswith("data: "):
+            continue
+        try:
+            events.append(json.loads(line[6:]))
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return events
+
+
+def build_thought_from_events(events, print_fn=None):
+    """Build a Thought from parsed SSE events. Returns (Thought, input_tokens)."""
+    text_parts = []
+    raw_content = []
+    tool_calls = []
+    current_tool = None
+    input_tokens = 0
+
+    for data in events:
+        event_type = data.get("type")
+
+        if event_type == "message_start":
+            input_tokens = data.get("message", {}).get("usage", {}).get("input_tokens", 0)
+
+        elif event_type == "content_block_start":
+            block = data.get("content_block", {})
+            if block.get("type") == "tool_use":
+                current_tool = {"id": block["id"], "name": block["name"], "input": ""}
+
+        elif event_type == "content_block_delta":
+            delta = data.get("delta", {})
+            if delta.get("type") == "text_delta":
+                text = delta["text"]
+                if print_fn:
+                    print_fn(text)
+                text_parts.append(text)
+            elif delta.get("type") == "input_json_delta":
+                if current_tool:
+                    current_tool["input"] += delta.get("partial_json", "")
+
+        elif event_type == "content_block_stop":
+            if current_tool:
+                tool_input = json.loads(current_tool["input"]) if current_tool["input"] else {}
+                tool_calls.append(ToolCall(
+                    id=current_tool["id"],
+                    name=current_tool["name"],
+                    args=tool_input
+                ))
+                current_tool = None
+
+    full_text = "".join(text_parts)
+    if full_text:
+        raw_content.append({"type": "text", "text": full_text})
+    for tc in tool_calls:
+        raw_content.append({"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.args})
+
+    return Thought(
+        text=full_text or None,
+        tool_calls=tool_calls,
+        raw_content=raw_content
+    ), input_tokens
+
+
 class Claude(Brain):
     """Claude API - the brain of our agent."""
 
@@ -152,6 +227,85 @@ class Claude(Brain):
         data = response.json()
         self.last_input_tokens = data.get("usage", {}).get("input_tokens", 0)
         return self._parse_response(data["content"])
+
+    def think_streaming(self, conversation):
+        """Streaming version of think() — prints tokens as they arrive."""
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        payload = {
+            "model": self.model,
+            "max_tokens": 4096,
+            "messages": conversation,
+            "stream": True,
+        }
+        if self.memory:
+            payload["system"] = self.memory.content
+        if self.tools:
+            payload["tools"] = self.tools
+
+        response = requests.post(self.url, headers=headers, json=payload, stream=True)
+        response.raise_for_status()
+
+        text_parts = []
+        raw_content = []
+        tool_calls = []
+        current_tool = None
+        input_tokens = 0
+
+        for line in response.iter_lines():
+            if not line:
+                continue
+            line = line.decode("utf-8")
+            if not line.startswith("data: "):
+                continue
+
+            data = json.loads(line[6:])
+            event_type = data.get("type")
+
+            if event_type == "message_start":
+                input_tokens = data.get("message", {}).get("usage", {}).get("input_tokens", 0)
+
+            elif event_type == "content_block_start":
+                block = data.get("content_block", {})
+                if block.get("type") == "tool_use":
+                    current_tool = {"id": block["id"], "name": block["name"], "input": ""}
+
+            elif event_type == "content_block_delta":
+                delta = data.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    text = delta["text"]
+                    print(text, end="", flush=True)  # Stream to terminal
+                    text_parts.append(text)
+                elif delta.get("type") == "input_json_delta":
+                    if current_tool:
+                        current_tool["input"] += delta.get("partial_json", "")
+
+            elif event_type == "content_block_stop":
+                if current_tool:
+                    tool_input = json.loads(current_tool["input"]) if current_tool["input"] else {}
+                    tool_calls.append(ToolCall(
+                        id=current_tool["id"],
+                        name=current_tool["name"],
+                        args=tool_input
+                    ))
+                    current_tool = None
+
+            elif event_type == "message_stop":
+                if text_parts:
+                    print()  # Newline after streamed text
+
+        self.last_input_tokens = input_tokens
+
+        full_text = "".join(text_parts)
+        if full_text:
+            raw_content.append({"type": "text", "text": full_text})
+        for tc in tool_calls:
+            raw_content.append({"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.args})
+
+        return Thought(text=full_text or None, tool_calls=tool_calls or None, raw_content=raw_content)
 
     def _parse_response(self, content):
         """Convert Claude's response format to Thought."""
@@ -332,6 +486,10 @@ class ReadFile:
                 lines = f.readlines()
             numbered_lines = [f"{i+1} | {line}" for i, line in enumerate(lines)]
             return "".join(numbered_lines)
+        except FileNotFoundError:
+            return f"Error: File not found: {path}"
+        except PermissionError:
+            return f"Error: Permission denied: {path}"
         except Exception as e:
             return f"Error reading file: {e}"
 
@@ -537,6 +695,36 @@ class RunCommand:
             return f"Error executing command: {e}"
 
 
+class SearchWeb:
+    """Searches the internet using DuckDuckGo."""
+    name = "search_web"
+    description = "Searches the internet for current information. Use when you need knowledge beyond your training data."
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "The search query"}
+        },
+        "required": ["query"]
+    }
+
+    def execute(self, context, query):
+        print(f"  → Searching web for '{query}'")
+        if DDGS is None:
+            return "Error: ddgs package not installed. Run: pip install ddgs"
+        try:
+            results = DDGS().text(query, max_results=3)
+            if not results:
+                return "No results found."
+
+            formatted = []
+            for r in results:
+                formatted.append(f"Title: {r['title']}\nURL: {r['href']}\nSummary: {r['body']}\n")
+
+            return "\n".join(formatted)
+        except Exception as e:
+            return f"Error searching web: {e}"
+
+
 # --- Tool Helpers ---
 
 def get_tool(tools, name):
@@ -554,7 +742,16 @@ def tool_definitions(tools):
 
 # --- Tools List ---
 
-tools = [ReadFile(), WriteFile(), EditFile(), ListFiles(), SearchCodebase(), SaveMemory(), RunCommand()]
+tools = [
+    ReadFile(),
+    WriteFile(),
+    EditFile(),
+    ListFiles(),
+    SearchCodebase(),
+    SaveMemory(),
+    RunCommand(),
+    SearchWeb(),
+]
 
 
 # --- Agent Class ---
@@ -696,7 +893,7 @@ def main():
     brain = BRAINS[brain_name](memory=memory, tools=tool_definitions(tools))
     agent = Agent(brain=brain, tools=tools, memory=memory, mode=mode, brain_name=brain_name)
 
-    print(f"⚡ Nanocode v0.9")
+    print(f"⚡ Nanocode v1.0")
     print(f"Commands: /q quit, /switch toggle brain, /mode [plan|act]")
     print(f"Brain: {brain_name}")
     if mode == "act":

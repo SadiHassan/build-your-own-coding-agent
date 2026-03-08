@@ -111,8 +111,8 @@ class ToolContext:
 
 class Brain:
     """Base class for LLM providers."""
-    context_limit = 200_000
-    last_input_tokens = 0
+    context_limit = 200_000  # Overridden per-instance in subclasses
+    last_input_tokens = 0    # Updated after each think() call
 
     def think(self, conversation):
         """Process conversation, return Thought."""
@@ -445,7 +445,7 @@ class RunCommand:
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=int(os.environ.get("NANOCODE_TIMEOUT", "30")),
                 cwd=os.getcwd()
             )
 
@@ -460,7 +460,7 @@ class RunCommand:
             return output.strip()
 
         except subprocess.TimeoutExpired:
-            return "Error: Command timed out after 30 seconds."
+            return "Error: Command timed out."
         except Exception as e:
             return f"Error executing command: {e}"
 

@@ -4,6 +4,10 @@ import subprocess
 import time
 import requests
 from dotenv import load_dotenv
+try:
+    from ddgs import DDGS
+except ImportError:
+    DDGS = None
 
 load_dotenv()
 
@@ -111,8 +115,8 @@ class ToolContext:
 
 class Brain:
     """Base class for LLM providers."""
-    context_limit = 200_000
-    last_input_tokens = 0
+    context_limit = 200_000  # Overridden per-instance in subclasses
+    last_input_tokens = 0    # Updated after each think() call
 
     def think(self, conversation):
         """Process conversation, return Thought."""
@@ -332,6 +336,10 @@ class ReadFile:
                 lines = f.readlines()
             numbered_lines = [f"{i+1} | {line}" for i, line in enumerate(lines)]
             return "".join(numbered_lines)
+        except FileNotFoundError:
+            return f"Error: File not found: {path}"
+        except PermissionError:
+            return f"Error: Permission denied: {path}"
         except Exception as e:
             return f"Error reading file: {e}"
 
@@ -517,7 +525,7 @@ class RunCommand:
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=int(os.environ.get("NANOCODE_TIMEOUT", "30")),
                 cwd=os.getcwd()
             )
 
@@ -532,7 +540,7 @@ class RunCommand:
             return output.strip()
 
         except subprocess.TimeoutExpired:
-            return "Error: Command timed out after 30 seconds."
+            return "Error: Command timed out."
         except Exception as e:
             return f"Error executing command: {e}"
 
@@ -551,8 +559,9 @@ class SearchWeb:
 
     def execute(self, context, query):
         print(f"  → Searching web for '{query}'")
+        if DDGS is None:
+            return "Error: ddgs package not installed. Run: pip install ddgs"
         try:
-            from ddgs import DDGS
             results = DDGS().text(query, max_results=3)
             if not results:
                 return "No results found."

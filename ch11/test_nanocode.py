@@ -17,7 +17,9 @@ class FakeBrain:
     context_limit = 200_000
     last_input_tokens = 0
 
-    def __init__(self, responses=None):
+    def __init__(self, responses=None, memory=None, tools=None):
+        self.memory = memory
+        self.tools = tools or []
         self.responses = responses or [Thought(text="Fake response", raw_content=[{"type": "text", "text": "Fake response"}])]
         self.call_count = 0
         self.last_conversation = None
@@ -60,6 +62,39 @@ def test_search_web_in_tool_definitions():
     definitions = tool_definitions(tools)
     names = [d["name"] for d in definitions]
     assert "search_web" in names
+
+
+def test_search_web_execute_success(monkeypatch):
+    """Verify SearchWeb.execute() returns formatted results."""
+    fake_results = [
+        {"title": "Python 3.13", "href": "https://python.org", "body": "Latest release"},
+    ]
+    monkeypatch.setattr("nanocode.DDGS", lambda: type("FakeDDGS", (), {"text": lambda self, q, max_results=3: fake_results})())
+    tool = SearchWeb()
+    context = ToolContext(mode="plan")
+    result = tool.execute(context, "latest python version")
+    assert "Python 3.13" in result
+    assert "https://python.org" in result
+
+
+def test_search_web_execute_no_results(monkeypatch):
+    """Verify SearchWeb.execute() handles empty results."""
+    monkeypatch.setattr("nanocode.DDGS", lambda: type("FakeDDGS", (), {"text": lambda self, q, max_results=3: []})())
+    tool = SearchWeb()
+    context = ToolContext(mode="plan")
+    result = tool.execute(context, "impossible query xyz")
+    assert "No results found" in result
+
+
+def test_search_web_execute_error(monkeypatch):
+    """Verify SearchWeb.execute() handles errors gracefully."""
+    def raise_error():
+        raise RuntimeError("Network down")
+    monkeypatch.setattr("nanocode.DDGS", lambda: type("FakeDDGS", (), {"text": lambda self, q, max_results=3: raise_error()})())
+    tool = SearchWeb()
+    context = ToolContext(mode="plan")
+    result = tool.execute(context, "test query")
+    assert "Error" in result
 
 
 # --- Previous Chapter Tests (Cumulative) ---

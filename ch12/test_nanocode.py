@@ -1,4 +1,4 @@
-"""Tests for Nanocode v1.0 (Chapter 11 - Web Search)."""
+"""Tests for Nanocode v1.0 (Chapter 12 - The Capstone)."""
 
 import os
 import tempfile
